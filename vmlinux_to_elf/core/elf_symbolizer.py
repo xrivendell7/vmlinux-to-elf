@@ -189,7 +189,7 @@ class ElfSymbolizer:
         r"""
             Find the entry point symbol. Based on executing this command
             on the Linux tree source:
-            
+
             for i in $(find -iname 'vmlinux.lds.S' -o -iname 'dyn.lds.S' -o -iname 'vmlinux-std.lds');
                 do echo "$i:"$(grep -P '^ENTRY\(' $i);
             done | grep -Po 'ENTRY\((.+?)\)' | sort -u

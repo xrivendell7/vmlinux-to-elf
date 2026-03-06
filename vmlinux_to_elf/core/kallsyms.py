@@ -5,7 +5,7 @@ import logging
 import math
 from enum import Enum
 from re import match, search, findall
-from struct import pack, unpack_from
+from struct import pack, unpack_from, calcsize
 from io import StringIO
 from typing import Optional
 
@@ -29,65 +29,63 @@ from vmlinux_to_elf.kernel_db.database import (
     This class will take a raw kernel image (.IMG), and return the file
     offsets for all kernel symbols, as well as the kallsyms_* structs and
     base addresses, etc.
-    
+
     It is used as an import by "vmlinuz_extractor.py" and "elf_symbolizer.py".
-    
+
     The kallsyms table's current layout was introduced in August 2004 (since
     kernel 2.6.10), its 2004+ implementation can be found here for parsing:
     https://github.com/torvalds/linux/blob/v2.6.32/kernel/kallsyms.c
     And here for generation:
     https://github.com/torvalds/linux/blob/v2.6.32/scripts/kallsyms.c
-    
+
     ^ This format is fully supported.
-    
+
     A major evolution is that since v4.6 (2016), by default on all architectures
     except IA64, a new label called "kallsyms_relative_base" was added and
     addresses are now offsets relative to this base, rather than relative
     addresses. Also, these offsets are stored as the GNU As ".long" type, which
     is 32-bits on x86_64.
-    
+
     https://github.com/torvalds/linux/commit/2213e9a66bb87d8344a1256b4ef568220d9587fb
-    
+
     ^ This format should be supported.
-    
+
     In v4.20 (2018), more fields were shrunk down independently.
-    
+
     https://github.com/torvalds/linux/commit/80ffbaa5b1bd98e80e3239a3b8cfda2da433009a
-    
+
     ^ This format should be supported.
-    
+
     Its 2002-2004 (versions 2.5.54-2.6.9) implementation code with basic "stem
     compression" can be found here for parsing:
     https://github.com/sarnobat/knoppix/blob/master/kernel/kallsyms.c
     Here for generation:
     https://github.com/sarnobat/knoppix/blob/master/scripts/kallsyms.c
     (patch https://lwn.net/Articles/18837/)
-    
+
     In 2002 (versions 2.5.49-2.5.53) it shortly had a version of this code
     without compression:
     https://kernel.googlesource.com/pub/scm/linux/kernel/git/ralf/linux/+/refs/tags/linux-2.5.49/kernel/kallsyms.c
     https://kernel.googlesource.com/pub/scm/linux/kernel/git/ralf/linux/+/refs/tags/linux-2.5.49/scripts/kallsyms
-    
+
     In earlier implementations (2000-2002), it was part of the modutils package
     and was more primitive (no real compression). Its implementation code can be found
     here for parsing:
     https://github.com/carlobar/uclinux_leon3_UD/blob/master/user/modutils-2.4.26/example/kallsyms.c
     Here for generation:
     https://github.com/carlobar/uclinux_leon3_UD/blob/master/user/modutils-2.4.26/obj/obj_kallsyms.c
-    
+
     Kernels 2.5.39-2.5.48 (2002) also had a transitory parser at "kernel/kallsyms.c", but the generation
     was still in modutils:
-    
+
     https://kernel.googlesource.com/pub/scm/linux/kernel/git/ralf/linux/+/refs/tags/linux-2.5.39/kernel/kallsyms.c
     (patch https://lwn.net/Articles/10796/)
 
-    
+
 """
 
 
 # Symbol types are the same as exposed by "man nm"
-
-
 class KallsymsSymbolType(Enum):
     # Seen in actual kernels
     ABSOLUTE = 'A'
@@ -171,16 +169,16 @@ class KallsymsFinder:
 
     """
         Symbols are output in this order:
-    
+
         $ curl -sL https://github.com/torvalds/linux/raw/v2.6.32/scripts/kallsyms.c | grep output_label
-        
+
             output_label("kallsyms_addresses");
             output_label("kallsyms_num_syms");
             output_label("kallsyms_names");
             output_label("kallsyms_markers");
             output_label("kallsyms_token_table");
             output_label("kallsyms_token_index");
-            
+
         We'll find kallsyms_token_table and infer the rest
     """
 
@@ -215,8 +213,6 @@ class KallsymsFinder:
             self.find_elf64_rela(base_address)
             self.apply_elf64_rela()
 
-        # -
-
         try:
             self.find_kallsyms_token_table()
             self.find_kallsyms_token_index()
@@ -229,7 +225,33 @@ class KallsymsFinder:
                 self.uncompressed_kallsyms = True
 
             except KallsymsNotFoundException:
-                raise first_error
+                try:
+
+                    finder = KsymtabFinder(
+                        kernel_img=self.kernel_img,
+                        is_64_bits=self.is_64_bits,
+                        is_big_endian=self.is_big_endian,
+                        kernel_base=getattr(self, 'kernel_text_candidate', None),
+                    )
+                    entries = finder.find()
+
+                    self.num_symbols = len(entries)
+                    self.kernel_addresses = [e.virtual_address for e in entries]
+                    self.symbol_names = ['T' + e.name for e in entries]
+                    self.symbols = []
+                    self.name_to_symbol = {}
+                    for e in entries:
+                        sym = KallsymsSymbol()
+                        sym.name = e.name
+                        sym.virtual_address = e.virtual_address
+                        sym.symbol_type = KallsymsSymbolType.TEXT  # ksymtab 导出的基本都是函数
+                        sym.is_global = True
+                        self.symbols.append(sym)
+                        self.name_to_symbol[e.name] = sym
+                    return
+
+                except KallsymsNotFoundException:
+                    raise first_error
 
         else:
             self.find_kallsyms_markers()
@@ -965,8 +987,7 @@ class KallsymsFinder:
                         break
                 else:
                     logging.info(
-                        '[+] Found kallsyms_markers at file offset 0x%08x'
-                        % position
+                        "[+] Found kallsyms_markers at file offset 0x%08x" % position
                     )
                     self.kallsyms_markers__offset = position
                     self.offset_table_element_size = table_element_size
@@ -1551,3 +1572,527 @@ class KallsymsFinder:
                 out_buffer.write(out_string + '\n')
             else:
                 logging.info(out_string)
+
+"""
+    __ksymtab / __ksymtab_gpl / __ksymtab_strings finder
+
+    For kernels without CONFIG_KALLSYMS that still support loadable modules.
+    These kernels retain EXPORT_SYMBOL() / EXPORT_SYMBOL_GPL() entries for
+    runtime module linking.
+
+    Layout in the kernel image (contiguous, in order):
+        __ksymtab          : array of struct kernel_symbol   (EXPORT_SYMBOL)
+        __ksymtab_gpl      : array of struct kernel_symbol   (EXPORT_SYMBOL_GPL)
+        __ksymtab_strings  : packed null-terminated names
+
+    Two historical struct formats exist:
+
+    (A) Legacy / direct-pointer format (pre-4.19, or without ARCH_PREL32_RELOCATIONS):
+        struct kernel_symbol {
+            unsigned long value;    // absolute virtual address of the symbol
+            const char   *name;     // absolute pointer into __ksymtab_strings
+        };
+        Entry size = 2 * pointer_size  (16 bytes on 64-bit, 8 bytes on 32-bit)
+
+    (B) Relative-offset format (4.19+ with CONFIG_HAVE_ARCH_PREL32_RELOCATIONS):
+        struct kernel_symbol {
+            s32 value_offset;       // symbol_addr = &value_offset + value_offset
+            s32 name_offset;        // name_addr   = &name_offset  + name_offset
+        };
+        (Some versions add a third s32 namespace_offset, making it 12 bytes.)
+        Entry size = 8 or 12 bytes regardless of architecture bitness.
+
+    Strategy:
+        1. Locate __ksymtab_strings by searching for a dense cluster of
+           well-known exported kernel symbol names (e.g. "module_layout",
+           "printk", "loops_per_jiffy", "__stack_chk_fail", etc.).
+        2. Determine the exact boundaries of the strings section.
+        3. Walk backwards from the strings section to find __ksymtab_gpl
+           and __ksymtab by validating that entries' name fields point
+           into the strings region.
+        4. Return a list of (address, name) pairs.
+
+    This should be added as methods of the KallsymsFinder class, or used
+    as a standalone helper.
+"""
+
+# These symbols are almost universally present across kernel versions
+# when CONFIG_MODULES is enabled.
+WELL_KNOWN_KSYMTAB_NAMES = [
+    b'module_layout',
+    b'module_put',
+    b'printk',
+    b'loops_per_jiffy',
+    b'__stack_chk_fail',
+    b'param_ops_int',
+    b'jiffies',
+    b'init_task',
+    b'__per_cpu_offset',
+    b'kfree',
+    b'kmalloc_caches',
+    b'__kmalloc',
+    b'vprintk',
+    b'_printk',
+    b'schedule',
+    b'__put_task_struct',
+    b'__mutex_init',
+    b'mutex_lock',
+    b'mutex_unlock',
+    b'strlen',
+    b'strcmp',
+    b'strcpy',
+    b'memcpy',
+    b'memset',
+    b'memmove',
+    b'vfree',
+    b'__vmalloc',
+    b'simple_strtoul',
+    b'snprintf',
+]
+
+MIN_WELL_KNOWN_HITS = 5
+MIN_TOTAL_STRINGS   = 20
+
+
+def _is_valid_ksym_name(data: bytes) -> bool:
+    """
+    Check whether a null-terminated byte string looks like a valid
+    kernel symbol name: [A-Za-z_][A-Za-z0-9_.]*
+    """
+    if not data or len(data) < 1:
+        return False
+    return bool(match(rb'^[A-Za-z_][A-Za-z0-9_.]*$', data))
+
+
+class KsymtabEntry:
+    """Represents one parsed __ksymtab entry."""
+    name: str
+    virtual_address: int        # resolved symbol address (or 0 if unknown)
+    from_gpl_table: bool
+
+    def __init__(self, name: str, virtual_address: int = 0,
+                 from_gpl_table: bool = False):
+        self.name = name
+        self.virtual_address = virtual_address
+        self.from_gpl_table = from_gpl_table
+
+    def __repr__(self):
+        tag = ' [GPL]' if self.from_gpl_table else ''
+        return f'<KsymtabEntry {self.name} @ 0x{self.virtual_address:x}{tag}>'
+
+
+class KsymtabFinder:
+    """
+    Standalone finder for __ksymtab / __ksymtab_gpl / __ksymtab_strings.
+
+    Can be used as a fallback when KallsymsFinder fails (no kallsyms),
+    or to augment symbol information for stripped ELF kernels.
+
+    Usage:
+        finder = KsymtabFinder(kernel_img, is_64_bits=True,
+                               is_big_endian=False)
+        entries = finder.find()
+        for e in entries:
+            print(f'{e.virtual_address:#x}  {e.name}')
+    """
+
+    def __init__(self, kernel_img: bytes,
+                 is_64_bits: bool = True,
+                 is_big_endian: bool = False,
+                 kernel_base: Optional[int] = None):
+        self.kernel_img = kernel_img
+        self.is_64_bits = is_64_bits
+        self.is_big_endian = is_big_endian
+        self.kernel_base = kernel_base   # 如果已知内核加载基址
+
+        self.endian = '>' if is_big_endian else '<'
+        self.ptr_size = 8 if is_64_bits else 4
+        self.ptr_fmt = 'Q' if is_64_bits else 'I'
+
+    # ────────────────────────────────────────────────────────────────
+    #  Step 1: 定位 __ksymtab_strings
+    # ────────────────────────────────────────────────────────────────
+
+    def _find_ksymtab_strings(self) -> tuple[int, int, list[tuple[int, bytes]]]:
+        """
+        在内核镜像中搜索 __ksymtab_strings 区域。
+
+        Returns:
+            (strings_start, strings_end, [(offset, name_bytes), ...])
+
+        策略：对每个已知符号名搜索所有出现位置，然后找到一个区间
+        使得多个已知名称密集地落在该区间内，且该区间中的所有字节
+        都是合法的 null-terminated 符号名。
+        """
+
+        img = self.kernel_img
+
+        # 收集所有已知名称的出现位置
+        # name_byte -> [list of offsets where it appears as a null-terminated string]
+        hit_offsets: list[int] = []
+
+        for name in WELL_KNOWN_KSYMTAB_NAMES:
+            needle = name + b'\x00'
+            pos = 0
+            while True:
+                pos = img.find(needle, pos)
+                if pos == -1:
+                    break
+                # 检查前一个字节是否是 \x00（即此名称的开头处有 null 终止符分隔）
+                if pos == 0 or img[pos - 1] == 0:
+                    hit_offsets.append(pos)
+                pos += 1
+
+        if len(hit_offsets) < MIN_WELL_KNOWN_HITS:
+            raise ValueError(
+                f'Only found {len(hit_offsets)} well-known ksymtab string '
+                f'hits (need >= {MIN_WELL_KNOWN_HITS})')
+
+        hit_offsets.sort()
+
+        # 用滑动窗口找到命中最密集的区域
+        best_cluster_start = 0
+        best_cluster_count = 0
+        WINDOW = 256 * 1024   # 256 KB 窗口——足以覆盖大多数 __ksymtab_strings
+
+        for i, off in enumerate(hit_offsets):
+            j = i
+            while j < len(hit_offsets) and hit_offsets[j] - off <= WINDOW:
+                j += 1
+            count = j - i
+            if count > best_cluster_count:
+                best_cluster_count = count
+                best_cluster_start = off
+
+        if best_cluster_count < MIN_WELL_KNOWN_HITS:
+            raise ValueError(
+                f'Best cluster only has {best_cluster_count} known names')
+
+        logging.info(
+            '[+] __ksymtab_strings: best cluster at 0x%08x with %d known '
+            'name hits' % (best_cluster_start, best_cluster_count))
+
+        # 从聚类中心向前/向后扩展，直到不再是合法的 null-terminated 符号名
+        # 向前找到区域起始
+        strings_start = best_cluster_start
+        while strings_start > 0 and img[strings_start - 1] != 0:
+            strings_start -= 1
+        # 继续向前跳过更多合法名称
+        while strings_start >= 2:
+            # 找到前一个字符串的起始
+            prev_end = strings_start - 1   # 这应该是 \x00
+            if img[prev_end] != 0:
+                break
+            prev_start = prev_end
+            while prev_start > 0 and img[prev_start - 1] != 0:
+                prev_start -= 1
+            candidate = img[prev_start:prev_end]
+            if _is_valid_ksym_name(candidate) and len(candidate) <= 128:
+                strings_start = prev_start
+            else:
+                break
+
+        # 向后找到区域结束
+        strings_end = best_cluster_start
+        while strings_end < len(img):
+            # 读取当前字符串
+            null_pos = img.find(b'\x00', strings_end)
+            if null_pos == -1:
+                break
+            candidate = img[strings_end:null_pos]
+            if _is_valid_ksym_name(candidate) and len(candidate) <= 128:
+                strings_end = null_pos + 1
+            else:
+                break
+
+        # 解析区域中的所有字符串
+        all_strings: list[tuple[int, bytes]] = []
+        pos = strings_start
+        while pos < strings_end:
+            null_pos = img.find(b'\x00', pos, strings_end + 256)
+            if null_pos == -1 or null_pos >= strings_end + 256:
+                break
+            name = img[pos:null_pos]
+            if _is_valid_ksym_name(name):
+                all_strings.append((pos, name))
+            else:
+                break
+            pos = null_pos + 1
+
+        logging.info(
+            '[+] __ksymtab_strings region: 0x%08x - 0x%08x (%d strings)'
+            % (strings_start, strings_end, len(all_strings)))
+
+        if len(all_strings) < MIN_TOTAL_STRINGS:
+            raise ValueError(
+                f'Only found {len(all_strings)} strings in candidate region '
+                f'(need >= {MIN_TOTAL_STRINGS})')
+
+        return strings_start, strings_end, all_strings
+
+    # ────────────────────────────────────────────────────────────────
+    #  Step 2: 从 __ksymtab_strings 往前找 __ksymtab / __ksymtab_gpl
+    # ────────────────────────────────────────────────────────────────
+
+    def _try_parse_ksymtab_relative(
+        self,
+        table_end: int,
+        strings_start: int,
+        strings_end: int,
+        all_strings: list[tuple[int, bytes]],
+    ) -> Optional[list[KsymtabEntry]]:
+        """
+        尝试以 relative-offset 格式 (s32 value_offset, s32 name_offset)
+        解析 __ksymtab 8byte
+
+        在此格式中:
+            name_addr = &name_offset + name_offset
+            即: name_addr = entry_file_offset + 4 + name_offset
+                (如果有 kernel_base: name_addr 是虚拟地址)
+
+        但在 raw image 中我们用文件偏移来验证。
+        """
+        ENTRY_SIZE = 8
+        img = self.kernel_img
+        endian = self.endian
+        string_offsets = {off for off, _ in all_strings}
+
+        # 从 table_end 往前逐个条目检查
+        entries: list[KsymtabEntry] = []
+        pos = table_end - ENTRY_SIZE
+
+        # 对齐到 4 字节
+        pos -= pos % 4
+
+        consecutive_failures = 0
+
+        while pos >= 0 and consecutive_failures < 3:
+            value_off, name_off = unpack_from(endian + 'ii', img, pos)
+
+            # name_offset 是相对于 &name_offset 字段的偏移
+            # &name_offset 在文件中的位置 = pos + 4
+            name_file_offset = (pos + 4) + name_off
+
+            if strings_start <= name_file_offset < strings_end:
+                # 验证该偏移确实是一个字符串的起始
+                null_pos = img.find(b'\x00', name_file_offset,
+                                    name_file_offset + 128)
+                if null_pos != -1:
+                    name = img[name_file_offset:null_pos]
+                    if _is_valid_ksym_name(name):
+                        # value_offset: symbol_addr = &value_offset + value_offset
+                        # 在文件偏移模式下: file_addr = pos + value_off
+                        # 如果有内核基址，可以转换为虚拟地址
+                        if self.kernel_base is not None:
+                            sym_va = self.kernel_base + pos + value_off
+                        else:
+                            sym_va = pos + value_off  # 作为文件偏移
+
+                        entries.append(KsymtabEntry(
+                            name=name.decode('ascii'),
+                            virtual_address=sym_va,
+                        ))
+                        consecutive_failures = 0
+                        pos -= ENTRY_SIZE
+                        continue
+
+            consecutive_failures += 1
+            pos -= ENTRY_SIZE
+
+        entries.reverse()
+
+        if len(entries) < MIN_TOTAL_STRINGS:
+            return None
+
+        logging.info(
+            '[+] Parsed %d entries in relative-offset format' % len(entries))
+        return entries
+
+    def _try_parse_ksymtab_legacy(
+        self,
+        table_end: int,
+        strings_start: int,
+        strings_end: int,
+        all_strings: list[tuple[int, bytes]],
+    ) -> Optional[list[KsymtabEntry]]:
+        """
+        尝试以 legacy 直接指针格式解析 __ksymtab。
+        struct kernel_symbol { unsigned long value; const char *name; };
+        条目大小 = 2 * ptr_size
+
+        name 字段是虚拟地址，指向 __ksymtab_strings 中的某个位置。
+        我们需要 kernel_base 来将虚拟地址转换为文件偏移。
+        如果没有 kernel_base 尝试从 name 指针推断。
+        """
+        img = self.kernel_img
+        endian = self.endian
+        ptr_size = self.ptr_size
+        ptr_fmt = self.ptr_fmt
+        ENTRY_SIZE = 2 * ptr_size
+
+        # 如果没有 kernel_base，尝试从第一个可以匹配的条目推断
+        inferred_base = self.kernel_base
+
+        if inferred_base is None:
+            # 从 table_end 往前扫描，找一个 name 指针，
+            # 使得 name_ptr - strings_start 得到的 base 合理
+            pos = table_end - ENTRY_SIZE
+            pos -= pos % ptr_size
+
+            for _ in range(min(1000, table_end // ENTRY_SIZE)):
+                if pos < 0:
+                    break
+                value, name_ptr = unpack_from(
+                    endian + ptr_fmt + ptr_fmt, img, pos)
+
+                # name_ptr 应该是 kernel_base + strings_start + <something>
+                # 所以 kernel_base = name_ptr - 某个 strings 区域内的文件偏移
+                # 我们检查 name_ptr 是否合理地大于 strings_start
+                for str_off, str_name in all_strings[:50]:
+                    candidate_base = name_ptr - str_off
+                    if candidate_base <= 0:
+                        continue
+                    # 验证：用这个 base 检查附近几个条目
+                    valid_count = 0
+                    for check_delta in range(0, min(5, 1000) * ENTRY_SIZE,
+                                             ENTRY_SIZE):
+                        check_pos = pos - check_delta
+                        if check_pos < 0:
+                            break
+                        _, check_name_ptr = unpack_from(
+                            endian + ptr_fmt + ptr_fmt, img, check_pos)
+                        check_file_off = check_name_ptr - candidate_base
+                        if (strings_start <= check_file_off < strings_end):
+                            null_p = img.find(b'\x00', check_file_off,
+                                              check_file_off + 128)
+                            if null_p != -1 and _is_valid_ksym_name(
+                                    img[check_file_off:null_p]):
+                                valid_count += 1
+                    if valid_count >= 3:
+                        inferred_base = candidate_base
+                        logging.info(
+                            '[+] Inferred kernel base from ksymtab name '
+                            'pointers: 0x%08x' % inferred_base)
+                        break
+                if inferred_base is not None:
+                    break
+                pos -= ENTRY_SIZE
+
+        if inferred_base is None:
+            logging.warning(
+                '[!] Cannot determine kernel base for legacy ksymtab parsing')
+            return None
+
+        entries: list[KsymtabEntry] = []
+        pos = table_end - ENTRY_SIZE
+        pos -= pos % ptr_size
+        consecutive_failures = 0
+
+        while pos >= 0 and consecutive_failures < 3:
+            value, name_ptr = unpack_from(
+                endian + ptr_fmt + ptr_fmt, img, pos)
+
+            name_file_off = name_ptr - inferred_base
+
+            if strings_start <= name_file_off < strings_end:
+                null_pos = img.find(b'\x00', name_file_off,
+                                    name_file_off + 128)
+                if null_pos != -1:
+                    name = img[name_file_off:null_pos]
+                    if _is_valid_ksym_name(name):
+                        entries.append(KsymtabEntry(
+                            name=name.decode('ascii'),
+                            virtual_address=value,
+                        ))
+                        consecutive_failures = 0
+                        pos -= ENTRY_SIZE
+                        continue
+
+            consecutive_failures += 1
+            pos -= ENTRY_SIZE
+
+        entries.reverse()
+
+        if len(entries) < MIN_TOTAL_STRINGS:
+            return None
+
+        logging.info(
+            '[+] Parsed %d entries in legacy pointer format' % len(entries))
+        return entries
+
+    # ────────────────────────────────────────────────────────────────
+    #  Step 3: 主入口
+    # ────────────────────────────────────────────────────────────────
+
+    def find(self) -> list[KsymtabEntry]:
+        """
+        主方法：查找并解析 __ksymtab 符号。
+
+        Returns:
+            list of KsymtabEntry, each with .name and .virtual_address
+        """
+
+        # 1. 定位 __ksymtab_strings
+        strings_start, strings_end, all_strings = \
+            self._find_ksymtab_strings()
+
+        logging.info('[+] Found __ksymtab_strings: 0x%08x - 0x%08x  (%d names)'
+                     % (strings_start, strings_end, len(all_strings)))
+
+        # 2. 在 strings 区域之前查找 ksymtab 表
+        #    对齐到 4 字节边界
+        table_end = strings_start
+        table_end -= table_end % 4
+
+        # 3. 先尝试 relative-offset 格式（更新的内核更常见）
+        entries = self._try_parse_ksymtab_relative(
+            table_end, strings_start, strings_end, all_strings)
+
+        if entries and len(entries) >= MIN_TOTAL_STRINGS:
+            logging.info('[+] Using relative-offset ksymtab format')
+        else:
+            # 再尝试 legacy 格式
+            entries = self._try_parse_ksymtab_legacy(
+                table_end, strings_start, strings_end, all_strings)
+            if entries and len(entries) >= MIN_TOTAL_STRINGS:
+                logging.info('[+] Using legacy pointer ksymtab format')
+            else:
+                raise ValueError(
+                    'Could not parse __ksymtab in either format')
+
+        # 4. 输出统计
+        logging.info('[+] Total ksymtab symbols found: %d' % len(entries))
+
+        return entries
+
+    def print_symbols(self, entries: Optional[list[KsymtabEntry]] = None):
+        """打印符号表，类似 /proc/kallsyms 格式"""
+        if entries is None:
+            entries = self.find()
+
+        addr_fmt = '016x' if self.is_64_bits else '08x'
+        for e in entries:
+            gpl_tag = ' [GPL]' if e.from_gpl_table else ''
+            print(f'{e.virtual_address:{addr_fmt}} T {e.name}{gpl_tag}')
+
+
+if __name__ == '__main__':
+    import sys
+
+    logging.basicConfig(level=logging.INFO,
+                        format='%(message)s')
+
+    if len(sys.argv) < 2:
+        print(f'Usage: {sys.argv[0]} <kernel_image> [--64|--32] [--be|--le]')
+        sys.exit(1)
+
+    with open(sys.argv[1], 'rb') as f:
+        data = f.read()
+
+    is_64 = '--32' not in sys.argv
+    is_be = '--be' in sys.argv
+
+    finder = KsymtabFinder(data, is_64_bits=is_64, is_big_endian=is_be)
+    results = finder.find()
+    finder.print_symbols(results)
+    print(f'\nTotal: {len(results)} exported symbols')

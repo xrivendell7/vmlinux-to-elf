@@ -9,10 +9,10 @@ from typing import Optional
 
 """
     Guess the architecture of a given binary.
-    
+
     For this, scan it for simple function prologues.
     Inspiration: https://github.com/ReFirmLabs/binwalk/blob/master/src/binwalk/magic/binarch
-    
+
     Also, return a sequence of the spacing in bytes
     between each detected function prologue, so that
     it can be matched with function symbols from the
